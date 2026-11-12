@@ -1,11 +1,6 @@
 "use strict";
 // Lift Log — everything is stored on this phone in localStorage.
 const KEY = "liftlog.v1";
-const PROVIDERS = {
-  nvidia: { name: "NVIDIA (free key + bridge)" },
-  groq: { name: "Groq (free key, easiest)" },
-  gemini: { name: "Google Gemini (free key)" }
-};
 const $ = (s, el = document) => el.querySelector(s);
 const $$ = (s, el = document) => [...el.querySelectorAll(s)];
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
@@ -27,22 +22,32 @@ const fmtN = n => (Math.round(n * 100) / 100).toString();
 
 function fresh(){
   return {
-    v: 1, split: "ppl", splits: clone(DEFAULT_SPLITS), logs: {}, journal: {},
-    timer: { dur: 180, auto: true },
-    ai: { provider: "nvidia", nvKey: "", nvProxy: "", nvModel: "nvidia/nemotron-3-super-120b-a12b", groqKey: "", groqModel: "llama-3.3-70b-versatile", gemKey: "", gemModel: "gemini-flash-latest", share: true },
-    chat: []
+    v: 2, split: "ppl", splits: clone(DEFAULT_SPLITS), logs: {}, notes: [], moods: {},
+    timer: { dur: 180, auto: true }
   };
 }
-function load(){
-  try {
-    const raw = localStorage.getItem(KEY);
-    if (raw) {
-      const s = JSON.parse(raw), f = fresh();
-      for (const k in f) if (!(k in s)) s[k] = f[k];
-      s.ai = { ...f.ai, ...s.ai }; if (!PROVIDERS[s.ai.provider]) s.ai.provider = "nvidia"; if (s.ai.nvModel === "meta/llama-3.3-70b-instruct") s.ai.nvModel = f.ai.nvModel; s.timer = { ...f.timer, ...s.timer };
-      return s;
+// Bring older saved data up to date (also used when restoring a backup).
+function upgrade(s){
+  const f = fresh();
+  if (!Array.isArray(s.notes)) {
+    // v1 journal had one entry per day: { mood, vent, mistakes, lesson } -> separate notes
+    s.notes = []; s.moods = {};
+    for (const [d, j] of Object.entries(s.journal || {})) {
+      if (j.mood) s.moods[d] = j.mood;
+      const L = s.logs?.[d], split = L?.split || s.split || "ppl";
+      const day = L?.day || s.splits?.[split]?.week[fromIso(d).getDay()] || "rest";
+      const base = fromIso(d).getTime() + 12 * 3600e3;
+      const add = (cat, text, k) => { if (text && text.trim()) s.notes.push({ id: uid(), date: d, cat, text: text.trim(), ts: base + k, split, day }); };
+      add("vent", j.vent, 0); add("learn", j.mistakes && "Mistake: " + j.mistakes, 1); add("learn", j.lesson, 2);
     }
-  } catch (e) {}
+  }
+  delete s.journal; delete s.ai; delete s.chat;
+  for (const k in f) if (!(k in s)) s[k] = f[k];
+  s.timer = { ...f.timer, ...s.timer }; s.v = 2;
+  return s;
+}
+function load(){
+  try { const raw = localStorage.getItem(KEY); if (raw) return upgrade(JSON.parse(raw)); } catch (e) {}
   return fresh();
 }
 let S = load();
@@ -58,7 +63,7 @@ function toast(msg, ms = 2400){
 
 // ---------- tabs ----------
 let tab = "workout";
-const TITLES = { workout: "Workout", timer: "Rest Timer", journal: "Journal", advisor: "Advisor" };
+const TITLES = { workout: "Workout", timer: "Rest Timer", journal: "Journal", lessons: "Lessons" };
 function go(t){
   tab = t;
   $$("nav.bottom button").forEach(b => b.classList.toggle("on", b.dataset.tab === t));
@@ -67,7 +72,7 @@ function go(t){
   if (t === "workout") renderWorkout();
   if (t === "timer") renderTimer(true);
   if (t === "journal") renderJournal();
-  if (t === "advisor") renderAdvisor();
+  if (t === "lessons") renderLessons();
   updateMini();
   window.scrollTo(0, 0);
 }
@@ -312,7 +317,7 @@ function refreshCalDot(){
 function openGuide(ex){
   const g = GUIDES[ex.guide];
   if (!g) {
-    sheet(ex.name, `<p>No coach guide is linked to this exercise yet.</p><p class="muted small">Open <b>Edit plan</b> → tap the exercise → choose a guide from the list, or ask the Advisor tab how to do it.</p>`);
+    sheet(ex.name, `<p>No coach guide is linked to this exercise yet.</p><p class="muted small">Open <b>Edit plan</b> → tap the exercise → choose a guide from the list.</p>`);
     return;
   }
   const m = muscles(ex);
@@ -520,256 +525,170 @@ function renderTimer(full){
 }
 
 // ================= JOURNAL =================
+// Each note: { id, date, cat: "vent" | "learn", text, ts, split, day }.
+// Learning notes remember which workout day they came from (push / pull / legs ...).
 let jDate = todayIso();
+let jCat = "vent";
 const MOODS = [["😤", "Angry"], ["😔", "Down"], ["😐", "Okay"], ["🙂", "Good"], ["💪", "Strong"]];
+const CATS = { vent: { name: "Venting", icon: "💭" }, learn: { name: "Learning", icon: "📘" } };
+const timeOf = ts => { const d = new Date(ts); return `${pad(d.getHours())}:${pad(d.getMinutes())}`; };
+const notesOn = date => S.notes.filter(n => n.date === date).sort((a, b) => a.ts - b.ts);
+function tagName(split, day){ return day === "rest" ? "Rest day" : dayName(S.splits[split] ? split : S.split, day); }
+// All places a lesson can be filed: days of the current split first, then the other split, then rest.
+function tagOptions(){
+  const out = [], seen = new Set();
+  for (const sp of [S.split, ...Object.keys(S.splits).filter(k => k !== S.split)]) {
+    for (const k of Object.keys(S.splits[sp].days)) if (!seen.has(k)) { seen.add(k); out.push({ split: sp, day: k, name: S.splits[sp].days[k].name }); }
+  }
+  out.push({ split: S.split, day: "rest", name: "Rest day / other" });
+  return out;
+}
+function tagSelect(id, cur){
+  return `<select id="${id}">${tagOptions().map(o => `<option value="${o.split}:${o.day}" ${o.day === cur.day ? "selected" : ""}>${esc(o.name)}</option>`).join("")}</select>`;
+}
+const readTag = v => { const [split, day] = v.split(":"); return { split, day }; };
+function addNote(date, cat, text, tag){
+  const t = tag || dayFor(date);
+  const ts = date === todayIso() ? Date.now() : fromIso(date).getTime() + 12 * 3600e3 + S.notes.length;
+  const n = { id: uid(), date, cat, text, ts, split: t.split, day: t.day };
+  S.notes.push(n); save(); return n;
+}
+function noteBadge(n){
+  const c = CATS[n.cat];
+  const tag = n.cat === "learn" ? ` · <span style="color:${DAY_COLORS[n.day] || "var(--muted)"}">${esc(tagName(n.split, n.day))}</span>` : "";
+  return `<span class="nbadge ${n.cat}">${c.icon} ${c.name}${tag}</span>`;
+}
+
 function renderJournal(){
   const el = $("#tab-journal");
-  const j = S.journal[jDate] || { mood: "", vent: "", mistakes: "", lesson: "" };
   const d = fromIso(jDate), isToday = jDate === todayIso();
-  const past = Object.keys(S.journal).filter(k => { const x = S.journal[k]; return x.vent || x.mistakes || x.lesson || x.mood; }).sort().reverse();
+  const mood = S.moods[jDate] || "";
+  const today = dayFor(jDate);
+  const list = notesOn(jDate);
+  const pastDates = [...new Set([...S.notes.map(n => n.date), ...Object.keys(S.moods).filter(k => S.moods[k])])].filter(k => k !== jDate).sort().reverse();
   el.innerHTML = `
     <div class="card">
       <div class="row between">
         <button class="icon-btn" id="jPrev" aria-label="Previous day">‹</button>
-        <div style="text-align:center"><b>${isToday ? "Today" : DOW_LONG[d.getDay()]}</b><div class="small muted">${d.getDate()} ${MON_LONG[d.getMonth()]} ${d.getFullYear()}</div></div>
+        <div style="text-align:center"><b>${isToday ? "Today" : DOW_LONG[d.getDay()]}</b><div class="small muted">${d.getDate()} ${MON_LONG[d.getMonth()]} ${d.getFullYear()} · ${esc(tagName(today.split, today.day))}</div></div>
         <button class="icon-btn" id="jNext" aria-label="Next day" ${isToday ? "disabled style='opacity:.35'" : ""}>›</button>
       </div>
       <label class="f">How do you feel?</label>
-      <div class="moods">${MOODS.map(([e, n]) => `<button data-mood="${n}" class="${j.mood === n ? "on" : ""}">${e} ${n}</button>`).join("")}</div>
-      <label class="f" for="jVent">Vent — let it all out</label>
-      <textarea id="jVent" data-j="vent" placeholder="What's on your mind? Nobody reads this but you.">${esc(j.vent)}</textarea>
-      <label class="f" for="jMist">Mistakes I made today</label>
-      <textarea id="jMist" data-j="mistakes" placeholder="In the gym, with food, sleep, people, study…">${esc(j.mistakes)}</textarea>
-      <label class="f" for="jLes">What I'll do better tomorrow</label>
-      <textarea id="jLes" data-j="lesson" style="min-height:70px" placeholder="One small thing.">${esc(j.lesson)}</textarea>
-      <div class="tiny faint" id="jSaved" style="margin-top:6px">Saved on this phone only. Auto-saves as you type.</div>
+      <div class="moods">${MOODS.map(([e, n]) => `<button data-mood="${n}" class="${mood === n ? "on" : ""}">${e} ${n}</button>`).join("")}</div>
     </div>
-    <div class="card"><h3 style="margin-bottom:4px">Past entries</h3>
-      ${past.length ? `<div class="jlist">${past.map(k => { const x = S.journal[k]; const m = MOODS.find(mm => mm[1] === x.mood); const first = (x.vent || x.mistakes || x.lesson || "").split("\n")[0].slice(0, 70); return `<button data-jd="${k}"><b>${niceDate(k)}</b> ${m ? m[0] : ""}<div class="small muted">${esc(first) || "—"}</div></button>`; }).join("")}</div>` : `<p class="small muted" style="margin:4px 0 0">Nothing yet. Your entries will show here.</p>`}
+    <div class="card">
+      <div class="seg" style="margin-bottom:10px">${Object.entries(CATS).map(([k, c]) => `<button data-cat="${k}" class="${jCat === k ? "on" : ""}">${c.icon} ${c.name}</button>`).join("")}</div>
+      ${jCat === "learn"
+        ? `<label class="f" for="jTag" style="margin-top:0">Goes to Lessons → <b>${esc(tagName(today.split, today.day))}</b> (today's workout). Change if needed:</label>${tagSelect("jTag", today)}`
+        : `<p class="small muted" style="margin:0 0 8px">Let it all out. Nobody reads this but you.</p>`}
+      <textarea id="jText" style="margin-top:8px" placeholder="${jCat === "learn" ? "What did you learn or get wrong today? e.g. Elbows flared on bench — tuck them next time." : "What's on your mind?"}"></textarea>
+      <button class="btn primary" id="jAdd" style="width:100%;margin-top:8px">+ Add ${CATS[jCat].name.toLowerCase()} note</button>
+    </div>
+    <div class="card"><h3 style="margin-bottom:6px">${isToday ? "Today's" : "This day's"} notes (${list.length})</h3>
+      ${list.length ? list.map(n => `<div class="note">
+        <div class="row between"><div>${noteBadge(n)}</div><span class="tiny faint">${timeOf(n.ts)}</span></div>
+        <div class="ntext">${esc(n.text)}</div>
+        <div class="row" style="gap:6px;margin-top:6px"><button class="btn sm" data-edit="${n.id}">Edit</button></div>
+      </div>`).join("") : `<p class="small muted" style="margin:0">No notes yet. Add as many as you want.</p>`}
+    </div>
+    <div class="card"><h3 style="margin-bottom:4px">Other days</h3>
+      ${pastDates.length ? `<div class="jlist">${pastDates.slice(0, 60).map(k => {
+        const ns = S.notes.filter(n => n.date === k), m = MOODS.find(mm => mm[1] === S.moods[k]);
+        const v = ns.filter(n => n.cat === "vent").length, l = ns.length - v;
+        const first = (ns[0]?.text || "").split("\n")[0].slice(0, 70);
+        return `<button data-jd="${k}"><b>${niceDate(k)}</b> ${m ? m[0] : ""} <span class="tiny faint">${v ? `💭 ${v}` : ""} ${l ? `📘 ${l}` : ""}</span><div class="small muted">${esc(first) || "—"}</div></button>`;
+      }).join("")}</div>` : `<p class="small muted" style="margin:4px 0 0">Nothing yet.</p>`}
     </div>`;
-  const cur = () => S.journal[jDate] || (S.journal[jDate] = { mood: "", vent: "", mistakes: "", lesson: "" });
-  $$("[data-j]", el).forEach(t => t.oninput = () => { cur()[t.dataset.j] = t.value; save(); $("#jSaved").textContent = "Saved ✓"; });
-  $$("[data-mood]", el).forEach(b => b.onclick = () => { const c = cur(); c.mood = c.mood === b.dataset.mood ? "" : b.dataset.mood; save(); renderJournal(); });
+  $$("[data-mood]", el).forEach(b => b.onclick = () => { S.moods[jDate] = S.moods[jDate] === b.dataset.mood ? "" : b.dataset.mood; save(); renderJournal(); });
+  $$("[data-cat]", el).forEach(b => b.onclick = () => { const t = $("#jText").value; jCat = b.dataset.cat; renderJournal(); $("#jText").value = t; });
+  $("#jAdd").onclick = () => {
+    const text = $("#jText").value.trim();
+    if (!text) { toast("Write something first"); return; }
+    const tag = jCat === "learn" ? readTag($("#jTag").value) : dayFor(jDate);
+    addNote(jDate, jCat, text, tag); renderJournal();
+    toast(jCat === "learn" ? `Saved to Lessons → ${tagName(tag.split, tag.day)}` : "Saved");
+  };
+  $$("[data-edit]", el).forEach(b => b.onclick = () => openNoteEditor(b.dataset.edit, renderJournal));
   $("#jPrev").onclick = () => { const x = fromIso(jDate); x.setDate(x.getDate() - 1); jDate = iso(x); renderJournal(); };
   $("#jNext").onclick = () => { if (isToday) return; const x = fromIso(jDate); x.setDate(x.getDate() + 1); jDate = iso(x); renderJournal(); };
   $$("[data-jd]", el).forEach(b => b.onclick = () => { jDate = b.dataset.jd; renderJournal(); window.scrollTo(0, 0); });
 }
-
-// ================= ADVISOR =================
-const PROXY_CODE = `// Cloudflare Worker: lets the Lift Log app talk to NVIDIA's free AI.
-// NVIDIA blocks calls straight from web pages, so this passes them along.
-const ALLOWED_ORIGIN = "https://hafiz123cm.github.io";
-export default {
-  async fetch(req) {
-    const cors = {
-      "Access-Control-Allow-Origin": ALLOWED_ORIGIN,
-      "Access-Control-Allow-Headers": "authorization, content-type",
-      "Access-Control-Allow-Methods": "POST, OPTIONS"
+function openNoteEditor(id, after){
+  const n = S.notes.find(x => x.id === id); if (!n) return;
+  sheet("Edit note", `
+    <div class="small muted" style="margin-bottom:8px">${niceDate(n.date)} · ${timeOf(n.ts)}</div>
+    <label class="f" for="neCat" style="margin-top:0">Type</label>
+    <select id="neCat">${Object.entries(CATS).map(([k, c]) => `<option value="${k}" ${k === n.cat ? "selected" : ""}>${c.icon} ${c.name}</option>`).join("")}</select>
+    <div id="neTagBox" class="${n.cat === "learn" ? "" : "hidden"}"><label class="f" for="neTag">Lesson for</label>${tagSelect("neTag", n)}</div>
+    <label class="f" for="neText">Note</label>
+    <textarea id="neText" style="min-height:140px">${esc(n.text)}</textarea>
+    <div class="row" style="margin-top:14px;gap:8px">
+      <button class="btn danger" id="neDel">Delete</button>
+      <button class="btn" data-close style="margin-left:auto">Cancel</button>
+      <button class="btn primary" id="neSave">Save</button>
+    </div>`, body => {
+    $("#neCat", body).onchange = e => $("#neTagBox", body).classList.toggle("hidden", e.target.value !== "learn");
+    $("#neDel", body).onclick = () => { if (!confirm("Delete this note?")) return; S.notes = S.notes.filter(x => x.id !== id); save(); closeSheet(); after(); };
+    $("#neSave", body).onclick = () => {
+      const text = $("#neText", body).value.trim(); if (!text) { toast("Note is empty"); return; }
+      n.text = text; n.cat = $("#neCat", body).value;
+      if (n.cat === "learn") Object.assign(n, readTag($("#neTag", body).value));
+      save(); closeSheet(); after(); toast("Saved");
     };
-    if (req.method === "OPTIONS") return new Response(null, { headers: cors });
-    if (req.method !== "POST") return new Response("POST only", { status: 405, headers: cors });
-    const r = await fetch("https://integrate.api.nvidia.com/v1/chat/completions", {
-      method: "POST",
-      headers: { "Authorization": req.headers.get("Authorization") || "", "Content-Type": "application/json" },
-      body: await req.text()
-    });
-    return new Response(r.body, { status: r.status, headers: { ...cors, "Content-Type": r.headers.get("Content-Type") || "application/json" } });
+  });
+}
+
+// ================= LESSONS =================
+// Every "Learning" note from the journal, sorted into the workout day it belongs to.
+let lTab = null;
+function lessonTabs(){
+  const opts = tagOptions(), used = new Set(S.notes.filter(n => n.cat === "learn").map(n => n.day));
+  const cur = Object.keys(S.splits[S.split].days);
+  return opts.filter(o => cur.includes(o.day) || used.has(o.day));
+}
+function renderLessons(){
+  const el = $("#tab-lessons"), tabs = lessonTabs();
+  if (!lTab || !tabs.some(t => t.day === lTab)) {
+    const t = dayFor(todayIso()).day;
+    lTab = tabs.some(x => x.day === t) ? t : tabs[0].day;
   }
-};`;
-let aiBusy = false;
-function mdLite(s){
-  let h = esc(s.replace(/<think>[\s\S]*?<\/think>/g, "").trim());
-  h = h.replace(/^#{1,6}\s*(.+)$/gm, "<b>$1</b>")
-       .replace(/\*\*(.+?)\*\*/g, "<b>$1</b>")
-       .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<i>$2</i>")
-       .replace(/^\s*[-*•]\s+/gm, "• ")
-       .replace(/`([^`]+)`/g, "<code>$1</code>")
-       .replace(/\n/g, "<br>");
-  return h;
-}
-function workoutContext(){
-  const sp = S.splits[S.split], t = todayIso(), info = dayFor(t);
-  const lines = [];
-  lines.push(`Split: ${sp.name}. Week: ${[1,2,3,4,5,6,0].map(i => `${DOW[i]} ${dayName(S.split, sp.week[i])}`).join(", ")}.`);
-  for (const [k, d] of Object.entries(sp.days)) lines.push(`${d.name} day exercises: ${d.ex.map(e => `${e.name} ${e.sets}x${e.rmin}-${e.rmax}`).join("; ")}.`);
-  lines.push(`Today is ${DOW_LONG[new Date().getDay()]} ${t}: ${dayName(info.split, info.day)} day.`);
-  const recent = Object.keys(S.logs).filter(d => hasData(S.logs[d])).sort().reverse().slice(0, 8);
-  if (recent.length) {
-    lines.push("Recent logged sessions (weight x reps):");
-    for (const d of recent) {
-      const L = S.logs[d];
-      const ex = Object.values(L.entries).filter(e => e.sets.some(s => s.w !== "" || s.r !== "")).map(e => `${e.name}: ${setsText(e)}`).join(" | ");
-      lines.push(`- ${d} ${dayName(L.split, L.day)}: ${ex}`);
-    }
-  } else lines.push("No sessions logged yet.");
-  lines.push("Units: 'plates' = number of plates per side of unknown weight; 'pin' = machine stack pin number.");
-  return lines.join("\n");
-}
-function systemPrompt(){
-  let p = `You are Coach, a very experienced strength and muscle-building coach. You have watched thousands of people train in commercial gyms and you know every common mistake (ego lifting, half reps, swinging, bad bracing, flared elbows, knees caving, no progressive overload, poor sleep and protein). The user lives in Malaysia. Talk in simple, friendly English with short sentences. Be practical and specific: exact sets, reps, weight changes, form cues and the mistakes to avoid. Push safe progressive overload. Keep answers short (under ~180 words) unless the user asks for detail. Use bullet points. If the user mentions sharp pain, numbness, a pop, or an injury, tell them to stop that exercise and see a doctor or physiotherapist — do not diagnose.`;
-  if (S.ai.share) p += `\n\nThe user's training data from their Lift Log app:\n${workoutContext()}`;
-  return p;
-}
-async function callAI(messages){
-  const a = S.ai;
-  let url, headers = { "Content-Type": "application/json" }, body;
-  if (a.provider === "nvidia") {
-    if (!a.nvKey || !a.nvProxy) throw new Error("NVIDIA needs your API key and bridge link. Open “AI settings” below.");
-    url = a.nvProxy.trim(); headers.Authorization = "Bearer " + a.nvKey.trim();
-    body = { model: a.nvModel || "nvidia/nemotron-3-super-120b-a12b", messages, temperature: 0.6, max_tokens: 1024 };
-  } else if (a.provider === "groq") {
-    if (!a.groqKey) throw new Error("Groq needs your free API key. Open “AI settings” below.");
-    url = "https://api.groq.com/openai/v1/chat/completions"; headers.Authorization = "Bearer " + a.groqKey.trim();
-    body = { model: a.groqModel || "llama-3.3-70b-versatile", messages, temperature: 0.6, max_tokens: 1024 };
-  } else {
-    if (!a.gemKey) throw new Error("Gemini needs your free API key. Open “AI settings” below.");
-    url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"; headers.Authorization = "Bearer " + a.gemKey.trim();
-    body = { model: a.gemModel || "gemini-flash-latest", messages, temperature: 0.6 };
-  }
-  const ctrl = new AbortController(), to = setTimeout(() => ctrl.abort(), 90000);
-  let res;
-  try { res = await fetch(url, { method: "POST", headers, body: JSON.stringify(body), signal: ctrl.signal }); }
-  catch (e) { throw new Error(e.name === "AbortError" ? "The AI took too long. Try again." : "Couldn't reach the AI. Check your internet" + (a.provider === "nvidia" ? " and the bridge link." : ".")); }
-  finally { clearTimeout(to); }
-  const txt = await res.text();
-  if (!res.ok) {
-    if (res.status === 401 || res.status === 403) throw new Error("The API key was rejected. Check it in AI settings.");
-    if ((res.status === 404 || res.status === 400) && /model/i.test(txt)) throw new Error("That AI model isn't available any more. Pick another model in AI settings.");
-    if (res.status === 429) throw new Error("Too many questions too fast (free limit). Wait a minute and try again.");
-    throw new Error(`AI error ${res.status}. ${txt.slice(0, 160)}`);
-  }
-  let j; try { j = JSON.parse(txt); } catch (e) { throw new Error("The AI sent back something unexpected. Try again."); }
-  const out = j.choices?.[0]?.message?.content;
-  if (!out) throw new Error("The AI gave an empty answer. Try again.");
-  return out;
-}
-async function ask(text){
-  text = text.trim(); if (!text || aiBusy) return;
-  S.chat.push({ role: "user", content: text }); save();
-  aiBusy = true; renderChat();
-  try {
-    const msgs = [{ role: "system", content: systemPrompt() }, ...S.chat.slice(-12).map(m => ({ role: m.role, content: m.content }))];
-    const out = await callAI(msgs);
-    S.chat.push({ role: "assistant", content: out.replace(/<think>[\s\S]*?<\/think>/g, "").trim() });
-  } catch (e) {
-    S.chat.push({ role: "error", content: e.message });
-  }
-  aiBusy = false; save(); renderChat();
-}
-const QUICK = ["Review my last workout", "How do I break a bench plateau?", "My lower back hurts after squats", "What should I eat to build muscle?", "Fix my lateral raise form"];
-function renderAdvisor(){
-  const el = $("#tab-advisor"), a = S.ai;
+  const curTab = tabs.find(t => t.day === lTab);
+  const items = S.notes.filter(n => n.cat === "learn" && n.day === lTab).sort((a, b) => b.ts - a.ts);
+  const count = k => S.notes.filter(n => n.cat === "learn" && n.day === k).length;
   el.innerHTML = `
-    <div class="card small"><b>Coach 🤖</b> <span class="muted">— ${esc(PROVIDERS[a.provider].name)}${a.share ? " · can see your workout log" : ""}</span></div>
-    <div class="chat" id="chat"></div>
-    <div class="qchips" id="qchips">${QUICK.map(q => `<button>${esc(q)}</button>`).join("")}</div>
-    <div class="composer"><textarea id="aiIn" rows="1" placeholder="Ask your coach…" aria-label="Message"></textarea><button class="btn primary" id="aiSend" style="height:44px">Send</button></div>
-    <details class="card" id="aiSet"><summary>⚙️ AI settings</summary>
-      <label class="f">Which AI</label>
-      <select id="aiProv">${Object.entries(PROVIDERS).map(([k, p]) => `<option value="${k}" ${k === a.provider ? "selected" : ""}>${esc(p.name)}</option>`).join("")}</select>
-      <div id="provBox"></div>
-      <div class="switch" style="margin-top:12px"><div><b>Let Coach see my workout log</b><div class="small muted">Sends your plan and last 8 sessions with each question. Journal is never sent.</div></div><input type="checkbox" id="aiShare" ${a.share ? "checked" : ""} aria-label="Share workout log"></div>
-      <button class="btn sm danger" id="aiClear" style="margin-top:12px">Clear chat</button>
-    </details>`;
-  renderProvBox(); renderChat();
-  const inp = $("#aiIn");
-  inp.oninput = () => { inp.style.height = "auto"; inp.style.height = Math.min(140, inp.scrollHeight) + "px"; };
-  $("#aiSend").onclick = () => { const v = inp.value; inp.value = ""; inp.style.height = ""; ask(v); };
-  inp.onkeydown = e => { if (e.key === "Enter" && !e.shiftKey && window.matchMedia("(pointer:fine)").matches) { e.preventDefault(); $("#aiSend").click(); } };
-  $$("#qchips button").forEach(b => b.onclick = () => ask(b.textContent));
-  $("#aiProv").onchange = e => { a.provider = e.target.value; save(); renderProvBox(); $(".card.small .muted", el).textContent = `— ${PROVIDERS[a.provider].name}${a.share ? " · can see your workout log" : ""}`; };
-  $("#aiShare").onchange = e => { a.share = e.target.checked; save(); };
-  $("#aiClear").onclick = () => { if (confirm("Clear the whole chat?")) { S.chat = []; save(); renderChat(); } };
-}
-const NV_MODELS = ["nvidia/nemotron-3-super-120b-a12b", "deepseek-ai/deepseek-v4.1-flash", "moonshotai/kimi-k2.6", "mistralai/mistral-large-4-1t-a52b", "openai/gpt-oss-20b", "nvidia/llama-3.1-nemotron-70b-instruct"];
-// Groq and Gemini can list their models from the phone, so we fill the picker and fix a retired default.
-async function fetchModels(kind){
-  const a = S.ai, key = kind === "groq" ? a.groqKey : a.gemKey; if (!key) return;
-  const url = kind === "groq" ? "https://api.groq.com/openai/v1/models" : "https://generativelanguage.googleapis.com/v1beta/openai/models";
-  try {
-    const r = await fetch(url, { headers: { Authorization: "Bearer " + key } }); if (!r.ok) return;
-    const ids = ((await r.json()).data || []).map(m => String(m.id).replace(/^models\//, "")).filter(i => !/whisper|tts|embed|guard|imagen|veo|image|audio|live|vision|orpheus|playai/i.test(i));
-    const dl = $("#mList"); if (dl) dl.innerHTML = ids.map(i => `<option value="${esc(i)}">`).join("");
-    const field = kind === "groq" ? "groqModel" : "gemModel";
-    if (ids.length && !ids.includes(a[field])) {
-      const pref = kind === "groq" ? ["llama-3.3-70b-versatile", "openai/gpt-oss-120b"] : ["gemini-flash-latest", "gemini-2.5-flash"];
-      a[field] = pref.find(p => ids.includes(p)) || ids.find(i => /flash|70b|120b/.test(i)) || ids[0]; save();
-      const inp = $(kind === "groq" ? "#gModel" : "#gmModel"); if (inp) inp.value = a[field];
-    }
-  } catch (e) {}
-}
-function renderProvBox(){
-  const a = S.ai, box = $("#provBox"); if (!box) return;
-  if (a.provider === "gemini") {
-    box.innerHTML = `
-      <p class="small muted">Google gives a free Gemini key with a daily limit. Works straight from this app. Get one at <b>aistudio.google.com/apikey</b> (sign in with Google → Create API key).</p>
-      <label class="f" for="gmKey">Gemini API key</label><input type="password" id="gmKey" value="${esc(a.gemKey)}" placeholder="AIza..." autocomplete="off">
-      <label class="f" for="gmModel">Model</label><input type="text" id="gmModel" list="mList" value="${esc(a.gemModel)}"><datalist id="mList"></datalist>
-      <p class="tiny faint">Your key stays on this phone.</p>`;
-    $("#gmKey").onchange = e => { a.gemKey = e.target.value.trim(); save(); renderChat(); fetchModels("gemini"); };
-    fetchModels("gemini");
-    $("#gmModel").onchange = e => { a.gemModel = e.target.value.trim() || "gemini-flash-latest"; save(); };
-  } else if (a.provider === "nvidia") {
-    box.innerHTML = `
-      <p class="small muted">NVIDIA gives a free API key (rate-limited, for personal use), but it blocks calls straight from web apps. So it needs a tiny free “bridge” (a Cloudflare Worker) that you make once:</p>
-      <ol class="small muted" style="padding-left:18px">
-        <li>Get a free key at <b>build.nvidia.com</b> → sign in → any model → “Get API Key”. It starts with <code>nvapi-</code>.</li>
-        <li>Make a free account at <b>dash.cloudflare.com</b> → Workers &amp; Pages → Create → Start with Hello World → Deploy → Edit code.</li>
-        <li>Delete everything there, paste the code below, press Deploy.</li>
-        <li>Copy the worker link (like <code>https://xxx.workers.dev</code>) and paste it below.</li>
-      </ol>
-      <button class="btn sm" id="copyProxy">Copy bridge code</button>
-      <div class="code" style="margin-top:6px">${esc(PROXY_CODE)}</div>
-      <label class="f" for="nvKey">NVIDIA API key</label><input type="password" id="nvKey" value="${esc(a.nvKey)}" placeholder="nvapi-..." autocomplete="off">
-      <label class="f" for="nvProxy">Bridge link (Cloudflare Worker URL)</label><input type="url" id="nvProxy" value="${esc(a.nvProxy)}" placeholder="https://lift-coach.yourname.workers.dev">
-      <label class="f" for="nvModel">Model</label><input type="text" id="nvModel" list="mList" value="${esc(a.nvModel)}"><datalist id="mList">${NV_MODELS.map(m => `<option value="${m}">`).join("")}</datalist>
-      <p class="tiny faint">Tap the box to pick another. Good ones: nemotron-3-super (NVIDIA's own), deepseek-v4.1-flash, kimi-k2.6. Your key stays on this phone.</p>`;
-    $("#copyProxy").onclick = () => navigator.clipboard?.writeText(PROXY_CODE).then(() => toast("Bridge code copied"), () => toast("Copy failed — select the code and copy"));
-    $("#nvKey").onchange = e => { a.nvKey = e.target.value.trim(); save(); renderChat(); };
-    $("#nvProxy").onchange = e => { a.nvProxy = e.target.value.trim(); save(); renderChat(); };
-    $("#nvModel").onchange = e => { a.nvModel = e.target.value.trim() || "nvidia/nemotron-3-super-120b-a12b"; save(); };
-  } else {
-    box.innerHTML = `
-      <p class="small muted">Groq is free, very fast, and works straight from this app — no bridge needed. Sign up free at <b>console.groq.com/keys</b> → Create API Key → paste it here.</p>
-      <label class="f" for="gKey">Groq API key</label><input type="password" id="gKey" value="${esc(a.groqKey)}" placeholder="gsk_..." autocomplete="off">
-      <label class="f" for="gModel">Model</label><input type="text" id="gModel" list="mList" value="${esc(a.groqModel)}"><datalist id="mList"></datalist>
-      <p class="tiny faint">Your key stays on this phone.</p>`;
-    $("#gKey").onchange = e => { a.groqKey = e.target.value.trim(); save(); renderChat(); fetchModels("groq"); };
-    fetchModels("groq");
-    $("#gModel").onchange = e => { a.groqModel = e.target.value.trim() || "llama-3.3-70b-versatile"; save(); };
-  }
-}
-function aiReady(){
-  const a = S.ai;
-  return a.provider === "nvidia" ? !!(a.nvKey && a.nvProxy) : a.provider === "groq" ? !!a.groqKey : !!a.gemKey;
-}
-function renderChat(){
-  const c = $("#chat"); if (!c) return;
-  if (!aiReady() && !S.chat.length) {
-    c.innerHTML = `<div class="msg a"><b>Set up your coach first (one time, free).</b><br>Open <b>⚙️ AI settings</b> below and follow the steps.<br><br>• <b>NVIDIA</b> — the one you asked for. Free key, plus a small free Cloudflare “bridge” (about 5 minutes).<br>• <b>Groq</b> — easiest. Free key, paste and go (about 1 minute).<br>• <b>Gemini</b> — free Google key, paste and go.</div>`;
-    const d = $("#aiSet"); if (d) d.open = true;
-  } else if (!S.chat.length && !aiBusy) {
-    c.innerHTML = `<div class="msg a">Hi! I'm your coach. Ask me about form, a plateau, pain, food, or tell me to review your last workout. I can see your log, so I'll tell you exactly what to do next session.</div>`;
-  } else {
-    c.innerHTML = S.chat.map(m => m.role === "user" ? `<div class="msg u">${esc(m.content)}</div>` : m.role === "error" ? `<div class="msg a err">⚠️ ${esc(m.content)}</div>` : `<div class="msg a">${mdLite(m.content)}</div>`).join("") + (aiBusy ? `<div class="msg a muted">Coach is thinking<span class="dots"></span></div>` : "");
-  }
-  const q = $("#qchips"); if (q) q.classList.toggle("hidden", S.chat.length > 0);
-  if (tab === "advisor") setTimeout(() => window.scrollTo(0, document.body.scrollHeight), 30);
+    <div class="subtabs">${tabs.map(t => `<button data-lt="${t.day}" class="${t.day === lTab ? "on" : ""}" style="--dc:${DAY_COLORS[t.day] || "var(--muted)"}">${esc(t.name)}<span>${count(t.day)}</span></button>`).join("")}</div>
+    <div class="card">
+      <label class="f" for="lText" style="margin-top:0">Add a ${esc(curTab.name)} lesson</label>
+      <textarea id="lText" style="min-height:70px" placeholder="e.g. Pause at the bottom of every rep — no bouncing."></textarea>
+      <button class="btn primary" id="lAdd" style="width:100%;margin-top:8px">+ Add lesson</button>
+      <p class="tiny faint" style="margin:6px 0 0">Lessons you write in Journal → Learning land here by themselves.</p>
+    </div>
+    ${items.length ? items.map(n => `<div class="card lesson" style="border-left:4px solid ${DAY_COLORS[n.day] || "var(--line)"}">
+      <div class="ntext" style="margin-top:0">${esc(n.text)}</div>
+      <div class="row between" style="margin-top:8px"><button class="linkish small" data-goj="${n.date}">📅 ${niceDate(n.date)}</button><button class="btn sm" data-edit="${n.id}">Edit</button></div>
+    </div>`).join("") : `<div class="card small muted">No ${esc(curTab.name)} lessons yet. After a ${esc(curTab.name)} session, write what you learned in Journal → Learning.</div>`}`;
+  $$("[data-lt]", el).forEach(b => b.onclick = () => { lTab = b.dataset.lt; renderLessons(); });
+  $("#lAdd").onclick = () => {
+    const text = $("#lText").value.trim(); if (!text) { toast("Write something first"); return; }
+    addNote(todayIso(), "learn", text, { split: curTab.split, day: curTab.day }); renderLessons(); toast("Lesson saved");
+  };
+  $$("[data-edit]", el).forEach(b => b.onclick = () => openNoteEditor(b.dataset.edit, renderLessons));
+  $$("[data-goj]", el).forEach(b => b.onclick = () => { jDate = b.dataset.goj; jCat = "learn"; go("journal"); });
 }
 
 // ================= SETTINGS / BACKUP =================
 let installEvt = null;
 window.addEventListener("beforeinstallprompt", e => { e.preventDefault(); installEvt = e; });
 $("#gear").onclick = () => {
-  const nLogs = Object.keys(S.logs).filter(d => hasData(S.logs[d])).length, nJ = Object.keys(S.journal).length;
+  const nLogs = Object.keys(S.logs).filter(d => hasData(S.logs[d])).length, nJ = S.notes.length;
   sheet("Settings & backup", `
     ${installEvt ? `<div class="card"><b>Install on your phone</b><p class="small muted" style="margin:4px 0 8px">Puts Lift Log on your home screen like a normal app. Needed for timer notifications.</p><button class="btn primary" id="doInstall">Install app</button></div>` : `<div class="card small muted"><b style="color:var(--text)">Install on your phone</b><br>Chrome menu ⋮ → <b>Add to Home screen</b> (or <b>Install app</b>). On iPhone Safari: Share → Add to Home Screen.</div>`}
-    <div class="card"><b>Backup</b><p class="small muted" style="margin:4px 0 8px">Your data lives only on this phone (${nLogs} workouts, ${nJ} journal days). Clearing Chrome data deletes it, so save a backup file now and then. API keys are not included.</p>
+    <div class="card"><b>Backup</b><p class="small muted" style="margin:4px 0 8px">Your data lives only on this phone (${nLogs} workouts, ${nJ} journal notes). Clearing Chrome data deletes it, so save a backup file now and then.</p>
       <div class="row" style="gap:8px"><button class="btn" id="bkOut">⬇ Save backup</button><label class="btn" style="display:inline-block">⬆ Restore<input type="file" id="bkIn" accept=".json,application/json" hidden></label></div></div>
-    <p class="tiny faint" style="text-align:center">Lift Log · works offline · nothing is uploaded except your Advisor questions</p>`, body => {
+    <p class="tiny faint" style="text-align:center">Lift Log · works offline · nothing is uploaded</p>`, body => {
     const ib = $("#doInstall", body); if (ib) ib.onclick = async () => { installEvt.prompt(); await installEvt.userChoice; installEvt = null; closeSheet(); };
     $("#bkOut", body).onclick = () => {
-      const data = clone(S); data.ai = { ...data.ai, nvKey: "", groqKey: "" };
+      const data = clone(S);
       const blob = new Blob([JSON.stringify({ app: "lift-log", saved: new Date().toISOString(), data }, null, 1)], { type: "application/json" });
       const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = `lift-log-backup-${todayIso()}.json`;
       document.body.appendChild(a); a.click(); setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
@@ -780,8 +699,7 @@ $("#gear").onclick = () => {
         const j = JSON.parse(await f.text());
         if (j.app !== "lift-log" || !j.data || !j.data.splits) throw new Error();
         if (!confirm("Replace everything in the app with this backup?")) return;
-        const keys = { nvKey: S.ai.nvKey, groqKey: S.ai.groqKey };
-        S = j.data; S.ai = { ...fresh().ai, ...S.ai, ...keys }; saveNow(); closeSheet(); go(tab); toast("Backup restored ✓");
+        S = upgrade(j.data); saveNow(); closeSheet(); go(tab); toast("Backup restored ✓");
       } catch (err) { toast("That file isn't a Lift Log backup"); }
     };
   });

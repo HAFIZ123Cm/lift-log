@@ -1,7 +1,7 @@
 {
   "name": "Lift Log",
   "short_name": "Lift Log",
-  "description": "Gym log with progressive overload reminders, rest timer, journal and an AI coach.",
+  "description": "Gym log with progressive overload reminders, rest timer, journal and lessons.",
   "lang": "en",
   "start_url": "./",
   "scope": "./",

@@ -1,5 +1,5 @@
 // Lift Log service worker: offline cache + rest-timer notifications.
-const CACHE = "lift-log-v1";
+const CACHE = "lift-log-v2";
 const SHELL = ["./", "index.html", "app.js", "data.js", "manifest.webmanifest", "icons/icon-192.png", "icons/icon-512.png", "icons/apple-touch-icon.png"];
 
 self.addEventListener("install", e => {
